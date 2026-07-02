@@ -40,13 +40,13 @@ HEADERS = {
 }
 
 # Items fetched per page. Upstream hard-coded 100; a larger page means far fewer
-# requests to the friend's server (Stage 3 efficiency). Verified safe > 100.
+# requests to the source server. Values well above 100 are accepted by Plex.
 CONTAINER_SIZE = config("PLEX_CONTAINER_SIZE", cast=int, default=400)
 
-# Refresh cadence (Stage 3b). A node is re-crawled on a random gap in this range,
-# so we don't hit all friends' servers on the same schedule. Incremental (Option C)
-# so most refreshes are cheap. FULL_CRAWL_DAYS forces a from-scratch show re-walk
-# periodically to heal any updatedAt/leafCount drift (the reconciliation pass).
+# Refresh cadence. A node is re-crawled on a random gap in this range, so all source
+# servers aren't hit on the same schedule. Refreshes are incremental (only changed
+# shows are re-fetched) so most are cheap. A periodic from-scratch rebuild reconciles
+# any updatedAt/leafCount drift.
 REFRESH_HOURS_MIN = config("REFRESH_HOURS_MIN", cast=int, default=5)
 REFRESH_HOURS_MAX = config("REFRESH_HOURS_MAX", cast=int, default=12)
 # Weekly-ish full rebuild, but RANDOMIZED across a range so the heavy crawl doesn't
@@ -162,6 +162,12 @@ def _get_servers() -> list[dict]:
 
 
 def get_plex_playlists(plex_servers: list = None) -> None:
+    # The ignore-list feature reads a named playlist from your OWN servers to hide
+    # those titles from the listing. When no playlist is configured there is nothing
+    # to do -- bail out so we never query any server needlessly.
+    if not IGNORE_PLAYLIST:
+        return
+
     pdb = _get_pickledb(autodump=True)  # pickledb (ignore-list); not the sqlite `db` module
 
     query_params = {
@@ -343,6 +349,10 @@ def crawl_movie_library(plex_server: dict = None, library: dict = None) -> None:
 
     for movie in _iter_section(uri, library["key"], token, media_type_num=1):
         title_year = _title_year(movie)
+        # collect all versions (Media x Part) of this movie that pass filters, THEN
+        # assign unique paths -- a movie can have several versions (e.g. 4k + 1080)
+        # that must each get a distinct file_path (and rating_key), not collide.
+        versions = []
         for media in movie.get("Media", []):
             for part in media.get("Part", []):
                 if not _passes_filters(part, media, MOVIE_MIN_SIZE):
@@ -350,14 +360,21 @@ def crawl_movie_library(plex_server: dict = None, library: dict = None) -> None:
                 if any(re.match(rf"{imt}", part["file"].split("/")[-1], flags=re.I)
                        for imt in IGNORE_MOVIE_TEMPLATES):
                     continue
-                rk = str(movie.get("ratingKey") or part["key"])
-                seen.add(rk)
-                rows.append({
-                    "server_node": node, "media_type": "movies", "rating_key": rk, "show_key": None,
-                    "file_path": f"{title_year}/{title_year}{_ext(part['file'])}",
-                    "plex_key": part["key"], "title": title_year,
-                    "updated_at": movie.get("updatedAt"), "added_at": movie.get("addedAt"),
-                })
+                versions.append({"part": part, **_file_attrs(part, media)})
+
+        suffixes = _version_suffixes(versions)
+        for v, suffix in zip(versions, suffixes):
+            part = v["part"]
+            rk = part["key"]  # per-file key -> unique per version (movie ratingKey is shared)
+            seen.add(rk)
+            rows.append({
+                "server_node": node, "media_type": "movies", "rating_key": rk, "show_key": None,
+                "file_path": f"{title_year}/{title_year}{suffix}{_ext(part['file'])}",
+                "plex_key": part["key"], "title": title_year,
+                "updated_at": movie.get("updatedAt"), "added_at": movie.get("addedAt"),
+                "size": v["size"], "duration": v["duration"],
+                "container": v["container"], "resolution": v["resolution"],
+            })
 
     db.upsert_media_batch(rows)
     # deletion diff: anything in SQLite for this node but NOT seen in this complete
@@ -372,10 +389,10 @@ def crawl_movie_library(plex_server: dict = None, library: dict = None) -> None:
 
 
 def crawl_show_library(plex_server: dict = None, library: dict = None) -> None:
-    """Crawl ONE show library using Option C: list shows cheaply (leafCount +
+    """Crawl ONE show library incrementally: list shows cheaply (leafCount +
     updatedAt, NO episode fetch), then only deep-fetch (allLeaves) shows that are
-    new or changed. Unchanged shows cost ZERO episode requests -- this is the fix
-    for the season-walk that never finished.
+    new or changed. Unchanged shows cost ZERO episode requests, which keeps the
+    crawl bounded even for very large TV libraries.
 
     Weekly reconciliation: if the last FULL crawl was longer ago than a RANDOM
     threshold in [FULL_CRAWL_DAYS_MIN, FULL_CRAWL_DAYS_MAX] days, run in force_full
@@ -432,7 +449,7 @@ def get_show_leaves(plex_server: dict = None, show_key: str = None, show_title: 
                     leaf_count: int = 0, updated_at: int = 0) -> None:
     """Fetch ALL episodes of ONE show in a single allLeaves request, replace that
     show's episodes in SQLite atomically, update its change-detection state, and
-    swap Redis. One request per changed show (vs one-per-season previously)."""
+    swap Redis. One request per changed show."""
     node, uri, token = plex_server["node"], plex_server["uri"], plex_server["token"]
     mc = _plex_get(uri, f"/library/metadata/{show_key}/allLeaves", token)
     show = show_title or mc.get("grandparentTitle") or "Unknown"
@@ -441,6 +458,14 @@ def get_show_leaves(plex_server: dict = None, show_key: str = None, show_title: 
     for ep in mc.get("Metadata", []):
         s_no = ep.get("parentIndex", 0)
         e_no = ep.get("index", 0)
+        ep_title = ep.get("title", "")
+        fname = f"{show} - S{int(s_no):02d}E{int(e_no):02d}"
+        if ep_title:
+            fname += f" - {ep_title}"
+
+        # collect this episode's versions, then assign unique paths (same multi-version
+        # handling as movies -- an episode can also have >1 version).
+        versions = []
         for media in ep.get("Media", []):
             for part in media.get("Part", []):
                 if not _passes_filters(part, media, EPISODE_MIN_SIZE):
@@ -448,17 +473,20 @@ def get_show_leaves(plex_server: dict = None, show_key: str = None, show_title: 
                 if any(re.match(rf"{imt}", part["file"].lower(), flags=re.I)
                        for imt in IGNORE_EPISODE_TEMPLATES):
                     continue
-                ep_title = ep.get("title", "")
-                fname = f"{show} - S{int(s_no):02d}E{int(e_no):02d}"
-                if ep_title:
-                    fname += f" - {ep_title}"
-                rows.append({
-                    "server_node": node, "media_type": "shows",
-                    "rating_key": str(ep.get("ratingKey") or part["key"]), "show_key": show_key,
-                    "file_path": f"{show}/Season {int(s_no):02d}/{fname}{_ext(part['file'])}",
-                    "plex_key": part["key"], "title": show,
-                    "updated_at": ep.get("updatedAt"), "added_at": ep.get("addedAt"),
-                })
+                versions.append({"part": part, **_file_attrs(part, media)})
+
+        suffixes = _version_suffixes(versions)
+        for v, suffix in zip(versions, suffixes):
+            part = v["part"]
+            rows.append({
+                "server_node": node, "media_type": "shows",
+                "rating_key": part["key"], "show_key": show_key,
+                "file_path": f"{show}/Season {int(s_no):02d}/{fname}{suffix}{_ext(part['file'])}",
+                "plex_key": part["key"], "title": show,
+                "updated_at": ep.get("updatedAt"), "added_at": ep.get("addedAt"),
+                "size": v["size"], "duration": v["duration"],
+                "container": v["container"], "resolution": v["resolution"],
+            })
 
     db.replace_show_episodes(node, show_key, rows)
     db.upsert_show_state(node, show_key, leaf_count, updated_at)
@@ -478,6 +506,39 @@ def _ext(file_path: str) -> str:
     return f".{base.rsplit('.', 1)[-1]}" if "." in base else ""
 
 
+def _version_suffixes(versions: list[dict]) -> list[str]:
+    """Given the versions (each {'resolution','container',...}) of ONE title, return a
+    parallel list of filename suffixes that make every version's path UNIQUE.
+
+    - single version  -> [""]                      (clean: no suffix)
+    - distinct resolutions -> [" - 4k", " - 1080"] (meaningful to the viewer; Plex
+                                                     treats these as multi-version)
+    - same resolution / missing -> a counter is appended so paths never collide
+      (" - 1080", " - 1080 (2)"), and as a final guarantee any remaining duplicate
+      suffix gets "(n)" until the whole list is unique.
+    """
+    if len(versions) <= 1:
+        return [""]
+
+    # base tag from resolution when present, else generic "v{i}"
+    tags = []
+    for i, v in enumerate(versions, start=1):
+        res = v.get("resolution")
+        tags.append(f" - {res}" if res else f" - v{i}")
+
+    # guarantee uniqueness: append " (n)" to any repeated tag
+    seen: dict[str, int] = {}
+    unique = []
+    for tag in tags:
+        if tag in seen:
+            seen[tag] += 1
+            unique.append(f"{tag} ({seen[tag]})")
+        else:
+            seen[tag] = 1
+            unique.append(tag)
+    return unique
+
+
 def _passes_filters(part: dict, media: dict, min_size_mb: int) -> bool:
     """Shared size/resolution/extension gate for movies and episodes."""
     if media.get("videoResolution") in IGNORE_RESOLUTIONS:
@@ -491,6 +552,17 @@ def _passes_filters(part: dict, media: dict, min_size_mb: int) -> bool:
     return True
 
 
+def _file_attrs(part: dict, media: dict) -> dict:
+    """Playback/filesystem attributes captured from a Part/Media, shared by movies
+    and episodes. Stored in SQLite (size also drives nginx's local HEAD response)."""
+    return {
+        "size": part.get("size"),
+        "duration": part.get("duration") or media.get("duration"),
+        "container": part.get("container") or media.get("container"),
+        "resolution": media.get("videoResolution"),
+    }
+
+
 def swap_redis_listing(server_node: str, media_type: str) -> int:
     """Rebuild the Redis serving listing for one server+type from SQLite.
 
@@ -500,7 +572,7 @@ def swap_redis_listing(server_node: str, media_type: str) -> int:
     never a half-built listing. Listing keys carry no TTL -- they live until the
     next swap replaces them. Returns the number of keys written.
     """
-    rows = db.get_media(server_node, media_type)  # [{file_path, plex_key}, ...]
+    rows = db.get_media(server_node, media_type)  # [{file_path, plex_key, size}, ...]
 
     old_keys = list(r.scan_iter(f"pr:files:{media_type}/{server_node}/*"))
     pipe = r.pipeline()
@@ -508,7 +580,10 @@ def swap_redis_listing(server_node: str, media_type: str) -> int:
         pipe.delete(*old_keys)
     for row in rows:
         key = f"pr:files:{media_type}/{server_node}/{row['file_path']}"
-        pipe.set(key, row["plex_key"])  # no TTL -- lives until next swap
+        # value = "<plex_key>|<size>". nginx splits on "|": the plex_key half is what
+        # it proxies to on playback (GET), and the size half lets it answer HEAD/size
+        # lookups locally without a round-trip to the origin server.
+        pipe.set(key, f"{row['plex_key']}|{row['size'] if row['size'] is not None else ''}")
     pipe.execute()
     return len(rows)
 
