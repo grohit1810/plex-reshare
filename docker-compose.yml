@@ -12,7 +12,8 @@ services:
     env_file:
       - .env
     ports:
-      - 6379:6379
+      # NOTE: 6379 (redis) intentionally NOT published -- it's internal only and runs
+      # with protected-mode off; exposing it to the host network is a needless risk.
       - 8080:8080
       # - 8000:8000  # mapping to starlette, for debugging mostly
     logging:
@@ -22,9 +23,9 @@ services:
     volumes:
       - "./:/pr"
 
-      # enable for development
-      # - "./app:/app"
-      # - "./rq:/rq"
+      # enable for development (mount our forked code over the baked-in image)
+      - "./app:/app"
+      - "./rq:/rq"
+      - "./nginx/nginx.vh.default.conf:/etc/nginx/conf.d/default.conf:ro"
       # - "./nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro"
-      # - "./nginx/nginx.vh.default.conf:/etc/nginx/conf.d/default.conf:ro"
       # - "./supervisord.conf:/etc/supervisord.conf"

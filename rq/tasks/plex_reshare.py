@@ -1,5 +1,4 @@
 import datetime
-import itertools
 import json
 import os
 import random
@@ -16,14 +15,18 @@ from starlette.config import Config
 
 import rq
 
-from .utilities import cleanup_path, get_common_paths, redis_connection
+from . import db
+from . import log as _log
+from .utilities import redis_connection
+
+logger = _log.get("crawl")
+kv = _log.kv
 
 config = Config()
 PLEX_TOKEN = config("PLEX_TOKEN", cast=str, default="")
 DEVELOPMENT = config("DEVELOPMENT", cast=bool, default=False)
 IGNORE_PLAYLIST = config("IGNORE_PLAYLIST", cast=str, default="")
-REDIS_REFRESH_TTL = 3 * 60 * 60
-REDIS_PATH_TTL = 24 * 60 * 60
+REDIS_REFRESH_TTL = 3 * 60 * 60  # server-list refresh cadence (NOT a listing TTL)
 IGNORE_EXTENSIONS = config("IGNORE_EXTENSIONS", cast=str, default="").split(',') + [None]
 IGNORE_RESOLUTIONS = config("IGNORE_RESOLUTIONS", cast=str, default="").split(',') + [None]
 IGNORE_MOVIE_TEMPLATES = [i for i in config("IGNORE_MOVIE_TEMPLATES", cast=str, default="").split('|') if i]
@@ -36,6 +39,30 @@ HEADERS = {
     " (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
 }
 
+# Items fetched per page. Upstream hard-coded 100; a larger page means far fewer
+# requests to the friend's server (Stage 3 efficiency). Verified safe > 100.
+CONTAINER_SIZE = config("PLEX_CONTAINER_SIZE", cast=int, default=400)
+
+# Refresh cadence (Stage 3b). A node is re-crawled on a random gap in this range,
+# so we don't hit all friends' servers on the same schedule. Incremental (Option C)
+# so most refreshes are cheap. FULL_CRAWL_DAYS forces a from-scratch show re-walk
+# periodically to heal any updatedAt/leafCount drift (the reconciliation pass).
+REFRESH_HOURS_MIN = config("REFRESH_HOURS_MIN", cast=int, default=5)
+REFRESH_HOURS_MAX = config("REFRESH_HOURS_MAX", cast=int, default=12)
+# Weekly-ish full rebuild, but RANDOMIZED across a range so the heavy crawl doesn't
+# land on an exact clockwork interval (an exact 7.000-day cadence looks obviously
+# automated in a friend's server logs). The threshold is seeded from last_full_crawl
+# so it stays STABLE across the many intermediate 5-12h checks, then re-rolls once a
+# full crawl actually happens.
+FULL_CRAWL_DAYS_MIN = config("FULL_CRAWL_DAYS_MIN", cast=int, default=6)
+FULL_CRAWL_DAYS_MAX = config("FULL_CRAWL_DAYS_MAX", cast=int, default=9)
+
+# One keep-alive Session reused across requests to a friend's server -> avoids a new
+# TLS handshake per call (gentler + faster). rq workers are separate processes, so a
+# module-level Session is safe here.
+session = requests.Session()
+session.headers.update(HEADERS)
+
 r = redis.Redis(
     host=config("REDIS_HOST", default="localhost"),
     port=config("REDIS_PORT", cast=int, default=6379),
@@ -46,20 +73,39 @@ rq_queue = rq.Queue(name="default", connection=redis_connection)
 rq_retries = rq.Retry(max=3, interval=[10, 30, 120])
 
 
+reqlog = _log.get("request")
+
+
+def _plex_get(uri: str, path: str, token: str, timeout: int = 20, **params) -> dict:
+    """GET a Plex endpoint and return its MediaContainer dict (or {} if absent).
+    Centralizes token injection, the Session, timeout, and defensive parsing.
+
+    This is the SINGLE chokepoint for every request to a friend's server, so we log
+    each one here: the path (token stripped), HTTP status, byte size, and elapsed ms.
+    That gives an exact request count + timing per crawl and surfaces errors with
+    context -- exactly what's needed to diagnose from shared logs."""
+    params["X-Plex-Token"] = token
+    started = time.monotonic()
+    try:
+        resp = session.get(f"https://{uri}{path}?{urlencode(params)}", timeout=timeout)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        resp.raise_for_status()
+        reqlog.info(kv(node=uri.split(".")[1] if "." in uri else uri, path=path,
+                       status=resp.status_code, bytes=len(resp.content), ms=elapsed_ms))
+        return resp.json().get("MediaContainer", {})
+    except requests.exceptions.Timeout:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        reqlog.warning(kv(path=path, error="timeout", ms=elapsed_ms))
+        raise
+    except requests.exceptions.RequestException as e:
+        # includes HTTP 4xx/5xx (raise_for_status), connection refused, etc.
+        status = getattr(getattr(e, "response", None), "status_code", "none")
+        reqlog.warning(kv(path=path, error=type(e).__name__, status=status))
+        raise
+
+
 def _get_pickledb(autodump: bool = True):
     return pickledb.load("/pr/pr.db", autodump)
-
-
-def _get_max_files() -> int:
-    date_start = config("DATE_START", cast=str, default=None)
-    files_day = config("FILES_DAY", cast=int, default=25)
-
-    if not date_start:
-        return 100_000_000
-    else:
-        date_start = datetime.datetime.strptime(date_start, "%Y-%m-%d")
-        date_now = datetime.datetime.now()
-        return abs((date_now - date_start).days) * files_day
 
 
 def _get_servers() -> list[dict]:
@@ -116,7 +162,7 @@ def _get_servers() -> list[dict]:
 
 
 def get_plex_playlists(plex_servers: list = None) -> None:
-    db = _get_pickledb(autodump=True)
+    pdb = _get_pickledb(autodump=True)  # pickledb (ignore-list); not the sqlite `db` module
 
     query_params = {
         "playlistType": "video",
@@ -168,15 +214,39 @@ def get_plex_playlists(plex_servers: list = None) -> None:
                                 .strip("/")
                             )
 
-                if db.exists("ignores"):
-                    existing_ignore_items = db.get("ignores")
+                if pdb.exists("ignores"):
+                    existing_ignore_items = pdb.get("ignores")
                     ignored_items = list(set(ignored_items + existing_ignore_items))
 
-                db.set("ignores", ignored_items)
+                pdb.set("ignores", ignored_items)
+
+
+def reconcile_lazy_deletes() -> None:
+    """Drain the lazy-delete reconcile queue and remove the corresponding rows from
+    SQLite (the source of truth). nginx already dropped the Redis key on the 404 for
+    an instant R: effect, but SQLite must also be cleaned or the next restart's
+    rebuild_redis_from_db() would resurrect the deleted item. Each queue entry is
+    "<node>|<media_type>|<file_path>". Deletes ONE item only (movie or episode),
+    never the whole show. Re-enqueues itself on the refresh cadence."""
+    drained = 0
+    while True:
+        entry = r.lpop("pr:lazydelete")
+        if not entry:
+            break
+        try:
+            node, media_type, file_path = entry.split("|", 2)
+        except ValueError:
+            continue
+        if db.lazy_delete_path(node, media_type, file_path):
+            drained += 1
+    if drained:
+        _log.get("lazydelete").info(kv(removed=drained))
+    # keep draining periodically (cheap no-op when the queue is empty)
+    rq_queue.enqueue_in(datetime.timedelta(minutes=15), "tasks.reconcile_lazy_deletes", retry=rq_retries)
 
 
 def get_plex_servers() -> None:
-    db = _get_pickledb(autodump=True)
+    pdb = _get_pickledb(autodump=True)  # pickledb (ignore-list); not the sqlite `db` module
     rkey = "pr:servers"
 
     if not r.exists(rkey):
@@ -193,306 +263,290 @@ def get_plex_servers() -> None:
         if IGNORE_PLAYLIST:
             rq_queue.enqueue("tasks.get_plex_playlists", at_front=True, retry=rq_retries, plex_servers=plex_servers)
 
-        if not db.exists("ignores"):
-            db.set("ignores", [])
+        if not pdb.exists("ignores"):
+            pdb.set("ignores", [])
     else:
         plex_servers = json.loads(r.get(rkey))
 
+    now = int(time.time())
     for plex_server in [ps for ps in plex_servers if not ps["owned"]]:
-        rkey_node_refresh = f"pr:node:{plex_server['node']}:refresh"
-        rkey_node_ip = f"pr:node:{plex_server['node']}:ip"
-        rkey_node_port = f"pr:node:{plex_server['node']}:port"
-        rkey_node_token = f"pr:node:{plex_server['node']}:token"
+        node = plex_server["node"]
 
-        # no need to refresh
-        if r.exists(rkey_node_refresh):
-            continue
+        # ALWAYS restore the node connection info nginx needs to stream files. Redis is
+        # wiped on every restart, so without this, playback 404s until the next crawl.
+        # This is cheap (local Redis writes) and hits NO friend server. Fixes the
+        # "playback broken for hours after restart" gap.
+        r.set(f"pr:node:{node}:ip", plex_server["ip"])
+        r.set(f"pr:node:{node}:port", str(plex_server["port"]))
+        r.set(f"pr:node:{node}:token", plex_server["token"])
 
-        r.set(rkey_node_refresh, str(datetime.datetime.now()))
-        r.expire(
-            rkey_node_refresh,
-            random.randint(6, 12) * random.randint(50, 60) * 60,
-        )
-
-        r.set(rkey_node_ip, plex_server["ip"])
-        r.set(rkey_node_port, str(plex_server["port"]))
-        r.set(rkey_node_token, plex_server["token"])
+        # Gate the actual crawl on the SQLite last_crawl (survives restarts), NOT a
+        # Redis throttle key (wiped every restart). Seeded-random threshold in
+        # [REFRESH_HOURS_MIN, REFRESH_HOURS_MAX] stays stable across restarts until a
+        # crawl actually happens -> 100 restarts/week do NOT cause 100 crawls.
+        last = db.node_last_crawl_ts(node)
+        if last is not None:
+            # seeded so the gap is stable across restarts; randomized in SECONDS across
+            # the [MIN, MAX]-hour window so refreshes don't recur at a fixed time of day.
+            rng = random.Random(last)
+            gap_secs = rng.randint(REFRESH_HOURS_MIN * 3600, REFRESH_HOURS_MAX * 3600)
+            age = now - last
+            if age < gap_secs:
+                logger.info("skip " + kv(node=node, reason="fresh", age_h=round(age / 3600, 1),
+                                         gap_h=round(gap_secs / 3600, 1)))
+                continue  # crawled recently -> restore-only, no requests to friend
+            logger.info("due " + kv(node=node, age_h=round(age / 3600, 1), gap_h=round(gap_secs / 3600, 1)))
+        else:
+            logger.info("due " + kv(node=node, reason="never_crawled"))
 
         rq_queue.enqueue("tasks.get_plex_libraries", retry=rq_retries, kwargs={"plex_server": plex_server})
 
 
 def get_plex_libraries(plex_server: dict = None) -> None:
-    query_params = {"X-Plex-Token": plex_server["token"]}
-    libraries = requests.get(
-        url=f"https://{plex_server['uri']}/library/sections?{urlencode(query_params)}",
-        timeout=15,
-        headers=HEADERS,
-    )
-
-    for library in libraries.json()["MediaContainer"]["Directory"]:
-        if library["type"] in ["movie", "show"]:
-            rq_queue.enqueue(
-                "tasks.get_plex_library",
-                retry=rq_retries,
-                kwargs={
-                    "plex_server": plex_server,
-                    "library": library,
-                    "offset": 0,
-                },
-            )
+    """Discover movie/show libraries on a server and enqueue one crawl job per
+    library (single-job-per-library -- so each crawl sees the COMPLETE set and can
+    safely do the deletion diff)."""
+    mc = _plex_get(plex_server["uri"], "/library/sections", plex_server["token"], timeout=15)
+    for library in mc.get("Directory", []):
+        if library.get("type") == "movie":
+            rq_queue.enqueue("tasks.crawl_movie_library", retry=rq_retries,
+                             kwargs={"plex_server": plex_server, "library": library})
+        elif library.get("type") == "show":
+            rq_queue.enqueue("tasks.crawl_show_library", retry=rq_retries,
+                             kwargs={"plex_server": plex_server, "library": library})
 
 
-def get_plex_library(
-    plex_server: dict = None,
-    library: dict = None,
-    offset: int = None,
-) -> None:
-    query_params = {
-        "X-Plex-Token": plex_server["token"],
-        "X-Plex-Container-Start": offset,
-        "X-Plex-Container-Size": 100,
-    }
-
-    library_res = requests.get(
-        url=f"https://{plex_server['uri']}/library/sections/{library['key']}/all?{urlencode(query_params)}",
-        headers=HEADERS,
-    )
-
-    media_container = library_res.json()["MediaContainer"]
-    rq_queue.enqueue(
-        f"tasks.get_{library['type']}s", kwargs={"media_container": media_container, "plex_server": plex_server}
-    )
-
-    if media_container["size"] + media_container["offset"] < media_container["totalSize"]:
-        offset += 100
-        rq_queue.enqueue_in(
-            datetime.timedelta(seconds=offset / (10 if library["type"] == "show" else 50)),
-            "tasks.get_plex_library",
-            retry=rq_retries,
-            at_front=True,
-            kwargs={
-                "plex_server": plex_server,
-                "library": library,
-                "offset": offset,
-            },
-        )
+def _iter_section(uri: str, key: str, token: str, media_type_num: int):
+    """Yield every item in a library section, paging with CONTAINER_SIZE. `type`
+    is 1 (movies) or 2 (shows). Uses the Size=0 trick to learn totalSize cheaply."""
+    start = 0
+    while True:
+        mc = _plex_get(uri, f"/library/sections/{key}/all", token,
+                       type=media_type_num,
+                       **{"X-Plex-Container-Start": start, "X-Plex-Container-Size": CONTAINER_SIZE})
+        items = mc.get("Metadata", [])
+        for item in items:
+            yield item
+        total = mc.get("totalSize", mc.get("size", 0))
+        start += CONTAINER_SIZE
+        if start >= total or not items:
+            break
 
 
-def get_movies(media_container: dict = None, plex_server: dict = None) -> None:
-    movies_list = {}
+def crawl_movie_library(plex_server: dict = None, library: dict = None) -> None:
+    """Crawl ONE movie library end-to-end in a single job: page through all movies,
+    upsert to SQLite, run the deletion diff against the COMPLETE fetched set, then
+    swap Redis. Because we hold the full set here, deletion detection is correct."""
+    node, uri, token = plex_server["node"], plex_server["uri"], plex_server["token"]
+    started = time.monotonic()
+    rows, seen = [], set()
 
-    for movie in media_container["Metadata"]:
-        for media in movie["Media"]:
-            if media.get("videoResolution") in IGNORE_RESOLUTIONS:
-                continue
-
-            for part in media["Part"]:
-                movie_key = part.get("key")
-                movie_path = part.get("file")
-
-                if (
-                    not movie_key
-                    or not movie_path
-                    or part.get("container") in IGNORE_EXTENSIONS
-                    or part.get("size", 1) / 1000000 < MOVIE_MIN_SIZE
-                ):
+    for movie in _iter_section(uri, library["key"], token, media_type_num=1):
+        title_year = _title_year(movie)
+        for media in movie.get("Media", []):
+            for part in media.get("Part", []):
+                if not _passes_filters(part, media, MOVIE_MIN_SIZE):
                     continue
-
-                movie_file = movie_path.split("/")[-1]
-
-                # ignore file that match a specific name-template
-                if any(re.match(rf"{imt}", movie_file, flags=re.I) for imt in IGNORE_MOVIE_TEMPLATES):
+                if any(re.match(rf"{imt}", part["file"].split("/")[-1], flags=re.I)
+                       for imt in IGNORE_MOVIE_TEMPLATES):
                     continue
+                rk = str(movie.get("ratingKey") or part["key"])
+                seen.add(rk)
+                rows.append({
+                    "server_node": node, "media_type": "movies", "rating_key": rk, "show_key": None,
+                    "file_path": f"{title_year}/{title_year}{_ext(part['file'])}",
+                    "plex_key": part["key"], "title": title_year,
+                    "updated_at": movie.get("updatedAt"), "added_at": movie.get("addedAt"),
+                })
 
-                movie_path = cleanup_path(path=movie_path)
-                movies_list[movie_key] = f"{movie_path}###{movie['title']} ({movie.get('year')})".replace(
-                    " (None)", ""
-                )
-
-    rkey_movies = f"pr:movies:{plex_server['node']}"
-    if r.exists(rkey_movies):
-        existing_movies_list = r.hgetall(rkey_movies)
-        movies_list.update(existing_movies_list)
-
-    if len(movies_list):
-        r.hmset(rkey_movies, movies_list)
-        r.expire(rkey_movies, 60 * 60)
-
-    rq_queue.enqueue_in(
-        datetime.timedelta(seconds=random.randint(10, 60)),
-        "tasks.process_media",
-        retry=rq_retries,
-        kwargs={
-            "plex_server": plex_server,
-            "media_type": "movies",
-        },
-    )
+    db.upsert_media_batch(rows)
+    # deletion diff: anything in SQLite for this node but NOT seen in this complete
+    # crawl was removed upstream. (We only reach here if the full crawl succeeded --
+    # an exception mid-crawl aborts the job and leaves the old snapshot intact.)
+    stale = db.get_rating_keys(node, "movies") - seen
+    db.delete_media_keys(node, "movies", list(stale))
+    swap_redis_listing(node, "movies")
+    db.record_crawl(node, "movies", status="ok", is_full=True)
+    logger.info("movies " + kv(node=node, kept=len(seen), deleted=len(stale),
+                               secs=round(time.monotonic() - started, 1)))
 
 
-def get_shows(media_container: dict = None, plex_server: dict = None) -> None:
-    for sid, show in enumerate(media_container["Metadata"]):
-        # rq_queue.enqueue_in(
-        #     datetime.timedelta(seconds=sid * 5),
-        rq_queue.enqueue(
-            "tasks.get_seasons",
-            retry=rq_retries,
-            at_front=True,
-            kwargs={
-                "show": show,
-                "plex_server": plex_server,
-                "show_count": sid,
-            },
-        )
+def crawl_show_library(plex_server: dict = None, library: dict = None) -> None:
+    """Crawl ONE show library using Option C: list shows cheaply (leafCount +
+    updatedAt, NO episode fetch), then only deep-fetch (allLeaves) shows that are
+    new or changed. Unchanged shows cost ZERO episode requests -- this is the fix
+    for the season-walk that never finished.
+
+    Weekly reconciliation: if the last FULL crawl was longer ago than a RANDOM
+    threshold in [FULL_CRAWL_DAYS_MIN, FULL_CRAWL_DAYS_MAX] days, run in force_full
+    mode -- deep-fetch every show regardless of leafCount/updatedAt, to heal any
+    drift where Plex changed content without bumping updatedAt. The threshold is
+    randomized (not an exact 7d) so the heavy crawl doesn't look like clockwork
+    automation in the friend's logs, and seeded from last_full so it stays stable
+    across the many intermediate 5-12h checks (only re-rolls after a full crawl)."""
+    node, uri, token = plex_server["node"], plex_server["uri"], plex_server["token"]
+    started = time.monotonic()
+    last_full = db.last_full_crawl_ts(node, "shows")
+    if last_full is None:
+        force_full = True
+    else:
+        # deterministic per last_full: same threshold on every check until next full crawl.
+        # Randomize in SECONDS across the [MIN, MAX]-day window (not whole days) so the
+        # heavy crawl doesn't recur at the same TIME OF DAY each cycle -- a fixed
+        # time-of-day would be an obvious fingerprint in the friend's logs even if the
+        # day varies. This spreads it across both date and clock time.
+        rng = random.Random(last_full)
+        threshold_secs = rng.randint(FULL_CRAWL_DAYS_MIN * 86400, FULL_CRAWL_DAYS_MAX * 86400)
+        force_full = (int(time.time()) - last_full) > threshold_secs
+
+    prior = db.get_show_state(node)  # {show_key: {leaf_count, updated_at}}
+    seen_shows = set()
+    changed = 0
+
+    for show in _iter_section(uri, library["key"], token, media_type_num=2):
+        show_key = str(show["ratingKey"])
+        seen_shows.add(show_key)
+        leaf = show.get("leafCount") or 0
+        upd = show.get("updatedAt") or 0
+        was = prior.get(show_key)
+        # deep-fetch if: weekly full rebuild, OR new, OR episode count/updatedAt changed
+        if force_full or was is None or was["leaf_count"] != leaf or (was["updated_at"] or 0) != upd:
+            changed += 1
+            rq_queue.enqueue("tasks.get_show_leaves", retry=rq_retries, kwargs={
+                "plex_server": plex_server, "show_key": show_key,
+                "show_title": show.get("title", "Unknown"), "leaf_count": leaf, "updated_at": upd,
+            })
+
+    # whole shows that vanished upstream -> drop their episodes + state
+    gone = set(prior) - seen_shows
+    deleted_eps = db.delete_shows(node, list(gone))
+    # finalize now for deletions/unchanged; changed shows each swap when they land
+    swap_redis_listing(node, "shows")
+    db.record_crawl(node, "shows", status="ok", is_full=force_full)
+    logger.info("shows " + kv(node=node, total=len(seen_shows), changed=changed,
+                              full=force_full, removed_shows=len(gone), removed_eps=deleted_eps,
+                              secs=round(time.monotonic() - started, 1)))
 
 
-def get_seasons(show: dict = None, plex_server: dict = None, show_count: int = 0):
-    time.sleep(0.2)
-    query_params = {
-        "X-Plex-Token": plex_server["token"],
-        "X-Plex-Container-Start": 0,
-        "X-Plex-Container-Size": 100,  # no more than 100 seasons
-        "excludeAllLeaves": 1,
-        "includeUserState": 0,
-    }
+def get_show_leaves(plex_server: dict = None, show_key: str = None, show_title: str = None,
+                    leaf_count: int = 0, updated_at: int = 0) -> None:
+    """Fetch ALL episodes of ONE show in a single allLeaves request, replace that
+    show's episodes in SQLite atomically, update its change-detection state, and
+    swap Redis. One request per changed show (vs one-per-season previously)."""
+    node, uri, token = plex_server["node"], plex_server["uri"], plex_server["token"]
+    mc = _plex_get(uri, f"/library/metadata/{show_key}/allLeaves", token)
+    show = show_title or mc.get("grandparentTitle") or "Unknown"
+    rows = []
 
-    seasons = requests.get(
-        url=f"https://{plex_server['uri']}{show['key']}?{urlencode(query_params)}",
-        timeout=10,
-        headers=HEADERS,
-    )
-
-    seasons_metadata = seasons.json()["MediaContainer"]["Metadata"]
-    for sid, season in enumerate(seasons_metadata):
-        # rq_queue.enqueue(
-        rq_queue.enqueue_in(
-            datetime.timedelta(seconds=sid * 10 + show_count),
-            "tasks.get_episodes",
-            retry=rq_retries,
-            # at_front=True,
-            kwargs={"season": season, "plex_server": plex_server, "last_season": sid + 1 == len(seasons_metadata)},
-        )
-
-
-def get_episodes(season: dict = None, plex_server: dict = None, offset: int = 0, last_season: bool = False) -> None:
-    episodes_list = {}
-
-    query_params = {
-        "X-Plex-Token": plex_server["token"],
-        "X-Plex-Container-Start": offset,
-        "X-Plex-Container-Size": 100,
-        "excludeAllLeaves": 1,
-        "includeUserState": 0,
-    }
-
-    episodes = requests.get(
-        url=f"https://{plex_server['uri']}{season['key']}?{urlencode(query_params)}",
-        timeout=10,
-        headers=HEADERS,
-    )
-
-    media_container = episodes.json()["MediaContainer"]
-    for episode in media_container["Metadata"]:
-        for media in episode["Media"]:
-            if media.get("videoResolution") in IGNORE_RESOLUTIONS:
-                continue
-
-            for part in media["Part"]:
-                episode_key = part.get("key")
-                episode_path = part.get("file")
-
-                if (
-                    not episode_key
-                    or not episode_path
-                    or part.get("container") in IGNORE_EXTENSIONS
-                    or part.get("size", 1) / 1000000 < EPISODE_MIN_SIZE
-                ):
+    for ep in mc.get("Metadata", []):
+        s_no = ep.get("parentIndex", 0)
+        e_no = ep.get("index", 0)
+        for media in ep.get("Media", []):
+            for part in media.get("Part", []):
+                if not _passes_filters(part, media, EPISODE_MIN_SIZE):
                     continue
-
-                # ignore file that match a specific path-template
-                if any(re.match(rf"{imt}", episode_path.lower(), flags=re.I) for imt in IGNORE_EPISODE_TEMPLATES):
+                if any(re.match(rf"{imt}", part["file"].lower(), flags=re.I)
+                       for imt in IGNORE_EPISODE_TEMPLATES):
                     continue
+                ep_title = ep.get("title", "")
+                fname = f"{show} - S{int(s_no):02d}E{int(e_no):02d}"
+                if ep_title:
+                    fname += f" - {ep_title}"
+                rows.append({
+                    "server_node": node, "media_type": "shows",
+                    "rating_key": str(ep.get("ratingKey") or part["key"]), "show_key": show_key,
+                    "file_path": f"{show}/Season {int(s_no):02d}/{fname}{_ext(part['file'])}",
+                    "plex_key": part["key"], "title": show,
+                    "updated_at": ep.get("updatedAt"), "added_at": ep.get("addedAt"),
+                })
 
-                episode_path = cleanup_path(path=episode_path)
-                episodes_list[episode_key] = episode_path
-
-    rkey_shows = f"pr:shows:{plex_server['node']}"
-    if r.exists(rkey_shows):
-        existing_episodes_list = r.hgetall(rkey_shows)
-        episodes_list.update(existing_episodes_list)
-
-    if len(episodes_list):
-        r.hmset(rkey_shows, episodes_list)
-        r.expire(rkey_shows, 60 * 60)
-
-    if media_container["size"] + media_container["offset"] < media_container["totalSize"]:
-        offset += 100
-        rq_queue.enqueue_in(
-            datetime.timedelta(seconds=offset / 5),
-            "tasks.get_episodes",
-            retry=rq_retries,
-            kwargs={
-                "season": season,
-                "plex_server": plex_server,
-                "offset": offset,
-            },
-        )
-
-    if last_season:
-        rq_queue.enqueue_in(
-            datetime.timedelta(seconds=random.randint(5, 120)),
-            "tasks.process_media",
-            retry=rq_retries,
-            kwargs={
-                "plex_server": plex_server,
-                "media_type": "shows",
-            },
-        )
+    db.replace_show_episodes(node, show_key, rows)
+    db.upsert_show_state(node, show_key, leaf_count, updated_at)
+    swap_redis_listing(node, "shows")
+    logger.debug("show_leaves " + kv(node=node, show=show, episodes=len(rows)))
 
 
-def process_media(plex_server: dict = None, media_type: str = None):
-    time.sleep(0.5)
-    medias_list = {}
-    db = _get_pickledb(autodump=False)
-    ignored_items = db.get("ignores") or []
+def _title_year(item: dict) -> str:
+    """'Title (Year)' with a graceful fallback when year is missing."""
+    year = item.get("year")
+    return f"{item['title']} ({year})" if year else item["title"]
 
-    rkey_medias = f"pr:{media_type}:{plex_server['node']}"
-    if r.exists(rkey_medias):
-        medias_list = r.hgetall(rkey_medias)
 
-    base_paths = get_common_paths(list(medias_list.values()))
-    medias_list = dict(sorted(medias_list.items(), key=lambda x: x[1]))
-    medias_list = dict(itertools.islice(medias_list.items(), _get_max_files())).items()
+def _ext(file_path: str) -> str:
+    """File extension including the dot, e.g. '.mkv'. Empty string if none."""
+    base = file_path.rsplit("/", 1)[-1]
+    return f".{base.rsplit('.', 1)[-1]}" if "." in base else ""
 
-    delete_keys = list(r.scan_iter(f"pr:files:{media_type}/{plex_server['node']}*"))
-    medias = {}
 
-    for media_key, media_path in medias_list:
-        for base_path in base_paths:
-            # media_path = re.sub(rf"^{base_path}/", "", media_path).lstrip("/")
-            media_path = re.sub(rf"{base_path}/", "", media_path).lstrip("/")
+def _passes_filters(part: dict, media: dict, min_size_mb: int) -> bool:
+    """Shared size/resolution/extension gate for movies and episodes."""
+    if media.get("videoResolution") in IGNORE_RESOLUTIONS:
+        return False
+    if not part.get("key") or not part.get("file"):
+        return False
+    if part.get("container") in IGNORE_EXTENSIONS:
+        return False
+    if part.get("size", 1) / 1_000_000 < min_size_mb:
+        return False
+    return True
 
-        if "###" in media_path:
-            media_path, media_base_placeholder = media_path.split("###")
-            media_path_chunks = list(filter(None, media_path.split("/")))
 
-            # add parent folder for root files
-            if len(media_path_chunks) == 1:
-                media_path = f"{media_base_placeholder}/{media_path}"
+def swap_redis_listing(server_node: str, media_type: str) -> int:
+    """Rebuild the Redis serving listing for one server+type from SQLite.
 
-        exclude_key = f"{plex_server['node']}/{media_path}"
-        if exclude_key in ignored_items:
-            continue
+    Reads the complete current set from SQLite, then in a SINGLE Redis pipeline
+    deletes the old pr:files:<type>/<node>/* keys and writes the new ones. Doing the
+    delete+write in one pipeline means readers only ever see a complete snapshot,
+    never a half-built listing. Listing keys carry no TTL -- they live until the
+    next swap replaces them. Returns the number of keys written.
+    """
+    rows = db.get_media(server_node, media_type)  # [{file_path, plex_key}, ...]
 
-        media_path = f"pr:files:{media_type}/{plex_server['node']}/{media_path}"
-        medias[media_key] = media_path
-
-    delete_keys = [x for x in delete_keys if x not in set(list(medias.values()))]
-
+    old_keys = list(r.scan_iter(f"pr:files:{media_type}/{server_node}/*"))
     pipe = r.pipeline()
-    if len(delete_keys) > 1:
-        r.delete(*delete_keys)
-
-    for media_key, media_path in medias.items():
-        r.set(media_path, media_key)
-        r.expire(media_path, REDIS_PATH_TTL)
+    if old_keys:
+        pipe.delete(*old_keys)
+    for row in rows:
+        key = f"pr:files:{media_type}/{server_node}/{row['file_path']}"
+        pipe.set(key, row["plex_key"])  # no TTL -- lives until next swap
     pipe.execute()
+    return len(rows)
+
+
+def rebuild_redis_from_db() -> int:
+    """Repopulate ALL of Redis from SQLite (used on restart when data is fresh).
+    Returns total keys written. Groups rows by (node, type) so each swap is atomic."""
+    db.init_db()
+    groups: dict[tuple[str, str], bool] = {}
+    for row in db.get_all_media():
+        groups[(row["server_node"], row["media_type"])] = True
+    total = 0
+    for node, media_type in groups:
+        total += swap_redis_listing(node, media_type)
+    _log.get("startup").info("rebuild_redis " + kv(items=total, groups=len(groups)))
+    return total
+
+
+def startup() -> None:
+    """Entry point enqueued by the web app on boot (replaces the old blind flushdb).
+
+    Restart-safe design:
+      1. If SQLite has media, immediately rebuild the Redis listing from it -> R: is
+         populated instantly on restart (no wait, no crawl).
+      2. ALWAYS run get_plex_servers now. It restores the per-node connection info
+         nginx needs for playback (Redis is wiped on restart) and then decides -- from
+         the SQLite-backed last_crawl, which survives restarts -- whether a 5-12h
+         refresh (or the 6-9 day full crawl) is actually due. So restarting 100x/week
+         does NOT cause 100 crawls; friends are hit only on the real cadence.
+    """
+    slog = _log.get("startup")
+    slog.info("boot " + kv(has_media=db.has_any_media()))
+    db.init_db()
+    # start the lazy-delete reconciler loop (drains pr:lazydelete -> sqlite cleanup)
+    rq_queue.enqueue("tasks.reconcile_lazy_deletes", job_id="reconcile_lazy_deletes", retry=rq_retries)
+
+    if db.has_any_media():
+        rebuild_redis_from_db()
+
+    # get_plex_servers restores node conn info + gates the crawl on SQLite last_crawl
+    rq_queue.enqueue("tasks.get_plex_servers", job_id="get_plex_servers", retry=rq_retries)

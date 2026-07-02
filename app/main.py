@@ -68,8 +68,10 @@ async def home(request):
 
 
 async def startup(*args, **kwargs):
-    r.flushdb()
-    rq_queue.enqueue("tasks.get_plex_servers", job_id="get_plex_servers", retry=rq_retries)
+    # Hand off boot to the worker's tasks.startup, which restores the Redis listing
+    # from the SQLite source of truth and only crawls the source servers when a
+    # refresh is actually due (see tasks.startup for the details).
+    rq_queue.enqueue("tasks.startup", job_id="startup", retry=rq_retries)
 
 
 routes = [
