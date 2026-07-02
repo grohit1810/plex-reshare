@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS media (
     show_key    TEXT,            -- for episodes: parent show ratingKey (NULL for movies)
     file_path   TEXT NOT NULL,   -- listing path -> becomes the R: entry
     plex_key    TEXT NOT NULL,   -- /library/parts/... -> what nginx proxies to
+    size        INTEGER,         -- file size in bytes; lets nginx answer HEAD locally
+    duration    INTEGER,         -- runtime in ms (from Media.duration)
+    container   TEXT,            -- e.g. 'mkv', 'mp4' (from Part/Media.container)
+    resolution  TEXT,            -- e.g. '1080', '4k' (from Media.videoResolution)
     title       TEXT,
     updated_at  INTEGER,
     added_at    INTEGER,
@@ -39,11 +43,11 @@ CREATE TABLE IF NOT EXISTS media (
 CREATE INDEX IF NOT EXISTS idx_media_node_type
     ON media (server_node, media_type);
 
--- for "replace all episodes of one show" (Option C per-show atomic replace)
+-- for "replace all episodes of one show" (per-show atomic replace)
 CREATE INDEX IF NOT EXISTS idx_media_show
     ON media (server_node, show_key);
 
--- Per-show change-detection state for Option C incremental crawl (Stage 3).
+-- Per-show change-detection state for the incremental crawl.
 CREATE TABLE IF NOT EXISTS show_state (
     server_node TEXT NOT NULL,
     show_key    TEXT NOT NULL,   -- show ratingKey
@@ -93,32 +97,42 @@ def _norm_rows(rows: list[dict]) -> list[dict]:
     """Ensure optional keys exist so executemany's named params never KeyError."""
     for row in rows:
         row.setdefault("show_key", None)
+        row.setdefault("size", None)
+        row.setdefault("duration", None)
+        row.setdefault("container", None)
+        row.setdefault("resolution", None)
     return rows
+
+
+_INSERT_MEDIA = """
+    INSERT INTO media (server_node, media_type, rating_key, show_key, file_path,
+                       plex_key, size, duration, container, resolution, title,
+                       updated_at, added_at)
+    VALUES (:server_node, :media_type, :rating_key, :show_key, :file_path,
+            :plex_key, :size, :duration, :container, :resolution, :title,
+            :updated_at, :added_at)
+    ON CONFLICT(server_node, media_type, rating_key) DO UPDATE SET
+        show_key=excluded.show_key,
+        file_path=excluded.file_path,
+        plex_key=excluded.plex_key,
+        size=excluded.size,
+        duration=excluded.duration,
+        container=excluded.container,
+        resolution=excluded.resolution,
+        title=excluded.title,
+        updated_at=excluded.updated_at,
+        added_at=excluded.added_at
+"""
 
 
 def upsert_media_batch(rows: list[dict]) -> None:
     """Insert-or-update a batch of media rows. Keys: server_node, media_type,
-    rating_key, show_key (None for movies), file_path, plex_key, title,
+    rating_key, show_key (None for movies), file_path, plex_key, size, title,
     updated_at, added_at. Accumulates with NO TTL."""
     if not rows:
         return
     with _conn() as c:
-        c.executemany(
-            """
-            INSERT INTO media (server_node, media_type, rating_key, show_key, file_path,
-                               plex_key, title, updated_at, added_at)
-            VALUES (:server_node, :media_type, :rating_key, :show_key, :file_path,
-                    :plex_key, :title, :updated_at, :added_at)
-            ON CONFLICT(server_node, media_type, rating_key) DO UPDATE SET
-                show_key=excluded.show_key,
-                file_path=excluded.file_path,
-                plex_key=excluded.plex_key,
-                title=excluded.title,
-                updated_at=excluded.updated_at,
-                added_at=excluded.added_at
-            """,
-            _norm_rows(rows),
-        )
+        c.executemany(_INSERT_MEDIA, _norm_rows(rows))
 
 
 def replace_show_episodes(server_node: str, show_key: str, rows: list[dict]) -> None:
@@ -133,19 +147,7 @@ def replace_show_episodes(server_node: str, show_key: str, rows: list[dict]) -> 
             (server_node, show_key),
         )
         if rows:
-            c.executemany(
-                """
-                INSERT INTO media (server_node, media_type, rating_key, show_key, file_path,
-                                   plex_key, title, updated_at, added_at)
-                VALUES (:server_node, :media_type, :rating_key, :show_key, :file_path,
-                        :plex_key, :title, :updated_at, :added_at)
-                ON CONFLICT(server_node, media_type, rating_key) DO UPDATE SET
-                    show_key=excluded.show_key, file_path=excluded.file_path,
-                    plex_key=excluded.plex_key, title=excluded.title,
-                    updated_at=excluded.updated_at, added_at=excluded.added_at
-                """,
-                _norm_rows(rows),
-            )
+            c.executemany(_INSERT_MEDIA, _norm_rows(rows))
 
 
 def delete_shows(server_node: str, show_keys: list[str]) -> int:
@@ -172,7 +174,7 @@ def get_media(server_node: str, media_type: str) -> list[sqlite3.Row]:
     """All media rows for one server+type -- used to rebuild the Redis listing."""
     with _conn() as c:
         return c.execute(
-            "SELECT file_path, plex_key FROM media "
+            "SELECT file_path, plex_key, size FROM media "
             "WHERE server_node = ? AND media_type = ?",
             (server_node, media_type),
         ).fetchall()
@@ -182,7 +184,7 @@ def get_all_media() -> list[sqlite3.Row]:
     """Every media row -- used to repopulate all of Redis on a fresh restart."""
     with _conn() as c:
         return c.execute(
-            "SELECT server_node, media_type, file_path, plex_key FROM media"
+            "SELECT server_node, media_type, file_path, plex_key, size FROM media"
         ).fetchall()
 
 
@@ -246,7 +248,7 @@ def lazy_delete_path(server_node: str, media_type: str, file_path: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# show_state (Stage 3 change-detection) -- defined now so the schema is stable
+# show_state (per-show change-detection)
 # --------------------------------------------------------------------------- #
 def get_show_state(server_node: str) -> dict[str, dict]:
     """{show_key: {'leaf_count': int, 'updated_at': int}} for change detection."""
