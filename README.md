@@ -1,6 +1,6 @@
 # PLEX-reshare
 
-Combo of [openresty](https://openresty.org/) + [starlette](https://www.starlette.io/) + [rq](https://python-rq.org) + [redis](https://redis.io/) to expose your Plex shares in a basic web-browsable `:8080`  format a'la apache directory listing.
+Combo of [openresty](https://openresty.org/) + [starlette](https://www.starlette.io/) + [rq](https://python-rq.org) + [redis](https://redis.io/) + [sqlite](https://www.sqlite.org/) to expose your Plex shares in a basic web-browsable `:8080`  format a'la apache directory listing.
 
 The reason behind this project it to make available your PLEX shares to other friends unrelated to the person who owns the original library.
 
@@ -45,6 +45,34 @@ All the movie/shows libraries exposed by a specific plex server will be listed a
 As of now it's not made to recreate the structure defined by a specific plex(admin) but more like grouping all the data available and use external option like PMM (Plex Meta Manager) to create a more structured format out of (subject to change if needed/requested, please fill an issue!).
 
 
+# How it works
+
+The catalog is built and served in three layers:
+
+- **Crawl (rq worker).** Discovers the servers shared with your token, then walks each
+  server's movie and TV libraries. TV shows are fetched with Plex's `allLeaves`
+  endpoint — every episode of a show in a single request — instead of walking season
+  by season. Movies and shows are stored in a local **SQLite** database, which is the
+  durable source of truth for the catalog.
+- **Serve (openresty + redis).** The browsable listing at `:8080` is served from Redis.
+  After each crawl the Redis listing is rebuilt from SQLite in one atomic swap, so a
+  reader never sees a half-built catalog. Playback requests are reverse-proxied
+  straight to the origin Plex server; nothing is stored or transcoded here.
+- **Persist (sqlite).** Because the catalog lives in SQLite, a restart repopulates Redis
+  from the database instead of re-crawling the source servers.
+
+**Refresh model.** Each server is re-crawled on a randomized interval
+(`REFRESH_HOURS_MIN`–`REFRESH_HOURS_MAX`). Refreshes are incremental: a show is only
+re-fetched when its episode count or `updatedAt` changes, so an unchanged library costs
+almost no requests. A full from-scratch rebuild runs on a longer randomized interval
+(`FULL_CRAWL_DAYS_MIN`–`FULL_CRAWL_DAYS_MAX`) to reconcile anything the incremental
+checks might miss. Deletions are detected by diffing a complete crawl against the
+database; a file that returns `404` on playback is also dropped from the listing on the
+spot (`LAZY_DELETE_ON_404`).
+
+> Please keep the defaults conservative and **do not heavily request data from the
+> origin servers**. Be nice!
+
 # Installation via Docker
 
 Docker images available https://hub.docker.com/r/peterbuga/plex-reshare
@@ -74,15 +102,19 @@ Browse to http://your-host-ip:8080 to access the list of plex reshares.
 |`REDIS_HOST`| (optional) option to use an external redis instance if already available, set `REDIS_INTERNAL: false`                                                                                                                                                                                                                                                                                                                                             | `127.0.0.1` |
 |`REDIS_PORT`| (optional) to used when `REDIS_INTERNAL: false`                                                                                                                                                                                                                                                                                                                                                                                                   | `11` |
 |`REDIS_DB_RQ`| (optional) if python-rq should run on a separate redis db                                                                                                                                                                                                                                                                                                                                                                                         | `11` |
-|`DATE_START`| (optional) needs to be under the format `YYYY-MM-DD`. <br>limit the number of files exposed, increment by `FILES_DAY` daily. <br><br>this is to expose a subset of files to Plex initially and can scan them daily incremental. not setting `DATE_START` will expose at once **ALL** the files it can find. <br><br>example: (today) 2024-03-05 - (DATE_START) 2024-02-01 * (FILES_DAY) 15 = 35 (days) * 15 => max 525 files will be exposed per library (either `movie` or `show` library type). | (unset) |
-|`FILES_DAY`| (optional) how many files increment expose every day per library                                                                                                                                                                                                                                                                                                                                                                                  | `25` |
-|`IGNORE_PLAYLIST`| (optional) generate a playlist, add items to it that you don't want to see in you library and they will slowly go away as the new refresh & trash process takes place                                                                                                                                                                                                                                                                                                                                                                                  | (unset) |
+|`IGNORE_PLAYLIST`| (optional) name of a playlist whose items should be excluded from the listing                                                                                                                                                                                                                                                                                                                                                                                  | (unset) |
 |`IGNORE_RESOLUTIONS`| (optional) list of resolutions comma separated that you'd like to ignore, ex: `sd` | (unset) |
 |`IGNORE_EXTENSIONS`| (optional) list of file extension comma separated that you'd like to ignore, ex: `avi,mpeg` | (unset) |
 |`MOVIE_MIN_SIZE`| (optional) minimal file size of a movie in Mb, everything below will be ignored | 512 |
 |`EPISODE_MIN_SIZE`| (optional)  minimal file size of an episode in Mb, everything below will be ignored | 64 |
 |`IGNORE_MOVIE_TEMPLATES`| (optional) list of python regexes to ignore being added to the list, pipe (`\|`) separated, ex: `.*sample.*` will ignore all the sample file sometimes associated with movie files | (unset) |
 |`IGNORE_EPISODE_TEMPLATES`| (optional) list of python regexes to ignore being added to the list, pipe (`\|`) separated | (unset) |
+|`PLEX_CONTAINER_SIZE`| (optional) items fetched per page when crawling; larger means fewer requests | `400` |
+|`REFRESH_HOURS_MIN` / `REFRESH_HOURS_MAX`| (optional) a server is re-crawled after a random gap in this hour range | `5` / `12` |
+|`FULL_CRAWL_DAYS_MIN` / `FULL_CRAWL_DAYS_MAX`| (optional) a full from-scratch rebuild runs after a random gap in this day range | `6` / `9` |
+|`LAZY_DELETE_ON_404`| (optional) drop a listing entry immediately when playback returns `404` | `true` |
+|`LOG_LEVEL`| (optional) `DEBUG` for per-request tracing, `INFO` for summaries | `INFO` |
+|`LOG_FILE`| (optional) also write logs to this file (e.g. `/pr/plex-reshare.log`); disabled if unset | (unset) |
 
 
 # Local image build
