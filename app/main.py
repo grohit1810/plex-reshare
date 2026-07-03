@@ -1,15 +1,10 @@
-import json
-import os
 import re
-import time
 
 import redis
 from starlette.applications import Starlette
 from starlette.config import Config
-from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 from starlette.routing import Route
 from starlette.templating import Jinja2Templates
 
@@ -48,7 +43,7 @@ class SetRqMiddleware(BaseHTTPMiddleware):
 async def home(request):
     context = {"request": request, "paths": []}
     location = request.path_params.get("path").strip("/")
-    location_esc = ''.join([(c if re.match(r"[a-zA-Z0-9\.\\]", c) else ("\\" + c)) for c in location])
+    location_esc = "".join([(c if re.match(r"[a-zA-Z0-9\.\\]", c) else ("\\" + c)) for c in location])
     entries = list(r.scan_iter(f"pr:files:{location_esc}*"))
 
     paths = {}

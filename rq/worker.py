@@ -1,5 +1,4 @@
-from tasks import db
-from tasks import log as _log
+from tasks import db, log as _log
 from tasks.utilities import redis_connection
 
 from rq import Connection, Queue, Worker

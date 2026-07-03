@@ -15,6 +15,7 @@ and is never lost to key expiry:
 Stdlib sqlite3 only -- no extra dependency. The DB lives at /pr/reshare.db, which
 persists across restarts via the existing ./:/pr bind mount.
 """
+
 import os
 import sqlite3
 import time
@@ -54,6 +55,18 @@ CREATE TABLE IF NOT EXISTS show_state (
     leaf_count  INTEGER,         -- last-seen episode count
     updated_at  INTEGER,         -- last-seen show updatedAt
     PRIMARY KEY (server_node, show_key)
+);
+
+-- Stable show->batch assignment (only used when SHOWS_PER_BATCH > 0). Lets a very
+-- large TV library be split into fixed-size batchNN/ folders in the listing. The
+-- assignment is PERSISTED so it is stable: an existing show never changes batch, so
+-- Plex rescans a show at most once. Keyed by the show's folder name (the first path
+-- segment), which is exactly how the flat listing already groups a show's episodes.
+CREATE TABLE IF NOT EXISTS show_batch (
+    server_node TEXT NOT NULL,
+    show_name   TEXT NOT NULL,   -- show folder name (file_path's first segment)
+    batch       INTEGER NOT NULL,-- 1-based batch number -> batchNN/ folder
+    PRIMARY KEY (server_node, show_name)
 );
 
 -- Bookkeeping so restarts can decide "rebuild from DB" vs "re-crawl".
@@ -174,8 +187,7 @@ def get_media(server_node: str, media_type: str) -> list[sqlite3.Row]:
     """All media rows for one server+type -- used to rebuild the Redis listing."""
     with _conn() as c:
         return c.execute(
-            "SELECT file_path, plex_key, size FROM media "
-            "WHERE server_node = ? AND media_type = ?",
+            "SELECT file_path, plex_key, size FROM media WHERE server_node = ? AND media_type = ?",
             (server_node, media_type),
         ).fetchall()
 
@@ -183,9 +195,7 @@ def get_media(server_node: str, media_type: str) -> list[sqlite3.Row]:
 def get_all_media() -> list[sqlite3.Row]:
     """Every media row -- used to repopulate all of Redis on a fresh restart."""
     with _conn() as c:
-        return c.execute(
-            "SELECT server_node, media_type, file_path, plex_key, size FROM media"
-        ).fetchall()
+        return c.execute("SELECT server_node, media_type, file_path, plex_key, size FROM media").fetchall()
 
 
 def count_media(server_node: str, media_type: str) -> int:
@@ -276,6 +286,80 @@ def upsert_show_state(server_node: str, show_key: str, leaf_count: int, updated_
 
 
 # --------------------------------------------------------------------------- #
+# show_batch (stable show -> batchNN assignment for large TV libraries)
+# --------------------------------------------------------------------------- #
+def sync_show_batches(server_node: str, show_names: list[str], batch_size: int) -> dict[str, int]:
+    """Reconcile the stable show->batch map for one server and return {show_name: batch}.
+
+    Guarantees an existing show NEVER changes batch (so Plex rescans a show at most
+    once), while keeping batches compact:
+
+      1. drop assignments for shows that vanished upstream  -> frees their slot
+      2. keep every surviving show's batch exactly as-is     -> never move
+      3. place each NEW show into the LOWEST-numbered batch that has a free slot
+         (reusing holes left by deletions); open a new batch only when all are full
+
+    Deterministic: new shows are placed in sorted order, so concurrent worker jobs
+    that call this with the same set converge to the same assignment. Runs in a single
+    transaction. `batch_size` must be > 0 (caller decides whether batching is on)."""
+    present = set(show_names)
+    with _conn() as c:
+        existing = {
+            row["show_name"]: row["batch"]
+            for row in c.execute(
+                "SELECT show_name, batch FROM show_batch WHERE server_node = ?",
+                (server_node,),
+            ).fetchall()
+        }
+
+        # 1. drop shows no longer present (free their slots)
+        gone = [name for name in existing if name not in present]
+        if gone:
+            c.executemany(
+                "DELETE FROM show_batch WHERE server_node = ? AND show_name = ?",
+                [(server_node, name) for name in gone],
+            )
+            for name in gone:
+                del existing[name]
+
+        # 2. surviving shows keep their batch; count occupancy per batch
+        counts: dict[int, int] = {}
+        for b in existing.values():
+            counts[b] = counts.get(b, 0) + 1
+
+        # 3. assign new shows to the lowest batch with a free slot, else a new batch
+        new_names = sorted(name for name in present if name not in existing)
+        max_batch = max(counts) if counts else 0
+        additions = []
+        for name in new_names:
+            target = None
+            for b in range(1, max_batch + 1):
+                if counts.get(b, 0) < batch_size:
+                    target = b
+                    break
+            if target is None:  # every existing batch full -> open the next one
+                max_batch += 1
+                target = max_batch
+            counts[target] = counts.get(target, 0) + 1
+            existing[name] = target
+            additions.append((server_node, name, target))
+        if additions:
+            c.executemany(
+                "INSERT INTO show_batch (server_node, show_name, batch) VALUES (?, ?, ?)",
+                additions,
+            )
+
+        return dict(existing)
+
+
+def clear_show_batches(server_node: str) -> None:
+    """Forget all batch assignments for a server (used when batching is turned off, so
+    a later re-enable starts fresh instead of reusing stale batch numbers)."""
+    with _conn() as c:
+        c.execute("DELETE FROM show_batch WHERE server_node = ?", (server_node,))
+
+
+# --------------------------------------------------------------------------- #
 # crawl_meta (restart / staleness bookkeeping)
 # --------------------------------------------------------------------------- #
 def record_crawl(server_node: str, media_type: str, status: str, is_full: bool, ts: int | None = None) -> None:
@@ -324,8 +408,7 @@ def node_last_crawl_ts(server_node: str) -> int | None:
     None if the node has never been crawled -> caller should crawl."""
     with _conn() as c:
         row = c.execute(
-            "SELECT MIN(last_crawl) FROM crawl_meta WHERE server_node = ? "
-            "AND last_status IN ('ok', 'partial')",
+            "SELECT MIN(last_crawl) FROM crawl_meta WHERE server_node = ? AND last_status IN ('ok', 'partial')",
             (server_node,),
         ).fetchone()
         return row[0] if row and row[0] is not None else None
