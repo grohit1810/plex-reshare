@@ -184,10 +184,13 @@ def delete_shows(server_node: str, show_keys: list[str]) -> int:
 
 
 def get_media(server_node: str, media_type: str) -> list[sqlite3.Row]:
-    """All media rows for one server+type -- used to rebuild the Redis listing."""
+    """All media rows for one server+type -- used to rebuild the Redis listing.
+    `mtime` is the file's modification time (Plex updatedAt, falling back to addedAt)
+    so nginx can report a real Last-Modified instead of the zero epoch."""
     with _conn() as c:
         return c.execute(
-            "SELECT file_path, plex_key, size FROM media WHERE server_node = ? AND media_type = ?",
+            "SELECT file_path, plex_key, size, COALESCE(updated_at, added_at) AS mtime "
+            "FROM media WHERE server_node = ? AND media_type = ?",
             (server_node, media_type),
         ).fetchall()
 

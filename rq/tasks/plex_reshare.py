@@ -651,10 +651,13 @@ def swap_redis_listing(server_node: str, media_type: str) -> int:
             show_name = file_path.split("/", 1)[0]
             file_path = f"batch{batch_of[show_name]:02d}/{file_path}"
         key = f"pr:files:{media_type}/{server_node}/{file_path}"
-        # value = "<plex_key>|<size>". nginx splits on "|": the plex_key half is what
-        # it proxies to on playback (GET), and the size half lets it answer HEAD/size
-        # lookups locally without a round-trip to the origin server.
-        pipe.set(key, f"{row['plex_key']}|{row['size'] if row['size'] is not None else ''}")
+        # value = "<plex_key>|<size>|<mtime>". nginx splits on "|": the plex_key half
+        # is what it proxies to on playback (GET); size lets it answer HEAD/size lookups
+        # locally without a round-trip to the origin; mtime (unix secs) becomes the
+        # Last-Modified header so rclone shows a real date, not the 1/1/2000 zero epoch.
+        size = row["size"] if row["size"] is not None else ""
+        mtime = row["mtime"] if row["mtime"] is not None else ""
+        pipe.set(key, f"{row['plex_key']}|{size}|{mtime}")
     pipe.execute()
     return len(rows)
 
