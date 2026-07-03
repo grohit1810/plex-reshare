@@ -502,13 +502,13 @@ def get_show_leaves(
     swap Redis. One request per changed show."""
     node, uri, token = plex_server["node"], plex_server["uri"], plex_server["token"]
     mc = _plex_get(uri, f"/library/metadata/{show_key}/allLeaves", token)
-    show = show_title or mc.get("grandparentTitle") or "Unknown"
+    show = _safe(show_title or mc.get("grandparentTitle") or "Unknown")
     rows = []
 
     for ep in mc.get("Metadata", []):
         s_no = ep.get("parentIndex", 0)
         e_no = ep.get("index", 0)
-        ep_title = ep.get("title", "")
+        ep_title = _safe(ep.get("title", ""))
         fname = f"{show} - S{int(s_no):02d}E{int(e_no):02d}"
         if ep_title:
             fname += f" - {ep_title}"
@@ -551,10 +551,37 @@ def get_show_leaves(
     logger.debug("show_leaves " + kv(node=node, show=show, episodes=len(rows)))
 
 
+def _safe(component: str) -> str:
+    """Sanitize a single path COMPONENT (a title, show name, or episode name) so it is
+    a valid folder/file name on the Windows R: mount and never fragments the listing.
+
+    Windows forbids these in a name: < > : " / \\ | ? *. Two problems they cause:
+      * '/' and '\\' are PATH SEPARATORS -- a title like "Sex/Life" or "Face/Off" would
+        split into phantom folders (Sex/ -> Life/) in the listing.
+      * ':' '?' '*' etc. are illegal in Windows filenames, so they can break the file
+        as WinFsp/Plex present it off R: (even though they are harmless in Redis/HTTP).
+
+    Replacement is chosen for readability + Plex matching (Plex re-matches via title +
+    year, so the exact punctuation need not survive):
+      * ": " -> " - " and bare ":" -> "-"   ("Alien: Covenant" -> "Alien - Covenant",
+                                              "3:10 to Yuma" -> "3-10 to Yuma")
+      * "/" "\\" "|" -> "-"
+      * "?" "*" "<" ">" '"' -> removed
+    """
+    component = component.replace(": ", " - ").replace(":", "-")
+    for ch in ("/", "\\", "|"):
+        component = component.replace(ch, "-")
+    for ch in ("?", "*", "<", ">", '"'):
+        component = component.replace(ch, "")
+    return component.strip()
+
+
 def _title_year(item: dict) -> str:
-    """'Title (Year)' with a graceful fallback when year is missing."""
+    """'Title (Year)' with a graceful fallback when year is missing. The title is
+    sanitized so a '/' in the name never becomes a spurious path separator."""
     year = item.get("year")
-    return f"{item['title']} ({year})" if year else item["title"]
+    title = _safe(item["title"])
+    return f"{title} ({year})" if year else title
 
 
 def _ext(file_path: str) -> str:
