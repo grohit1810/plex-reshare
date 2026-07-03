@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS crawl_meta (
     last_status     TEXT,        -- 'ok' | 'partial' | 'failed'
     PRIMARY KEY (server_node, media_type)
 );
+
+-- Per-folder Plex scan tracking (targeted-scan feature). A "folder" is a movie
+-- folder or a season folder as Plex sees it on the mount. Populated by reconcile;
+-- drained by the scan worker one folder per interval.
+CREATE TABLE IF NOT EXISTS scan_state (
+    server_node  TEXT NOT NULL,   -- friend clientIdentifier (the mount GUID)
+    media_type   TEXT NOT NULL,   -- 'movies' | 'shows'
+    scan_path    TEXT NOT NULL,   -- mount-relative FOLDER, e.g. movies/<guid>/Title
+    status       TEXT NOT NULL,   -- 'pending' | 'requested' | 'scanned' | 'blocked'
+    requested_at INTEGER,         -- unix secs; last scan request
+    scanned_at   INTEGER,         -- unix secs; confirmed present in Plex
+    PRIMARY KEY (server_node, media_type, scan_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_status ON scan_state (status);
 """
 
 
@@ -193,6 +208,27 @@ def get_media(server_node: str, media_type: str) -> list[sqlite3.Row]:
             "FROM media WHERE server_node = ? AND media_type = ?",
             (server_node, media_type),
         ).fetchall()
+
+
+def catalog_serving_paths(server_node: str, media_type: str, batch_of: dict | None) -> set[str]:
+    """Mount-relative catalog FILE paths for a node+type, matching exactly what the
+    Redis serving listing uses (including the optional batchNN/ prefix for shows).
+    `batch_of` maps show_name -> batch number when batching is on, else None."""
+    out: set[str] = set()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT file_path FROM media WHERE server_node = ? AND media_type = ?",
+            (server_node, media_type),
+        ).fetchall()
+    for r in rows:
+        fp = r["file_path"]
+        if batch_of:
+            show = fp.split("/", 1)[0]
+            b = batch_of.get(show)
+            if b is not None:
+                fp = f"batch{b:02d}/{fp}"
+        out.add(f"{media_type}/{server_node}/{fp}")
+    return out
 
 
 def get_all_media() -> list[sqlite3.Row]:
@@ -415,3 +451,99 @@ def node_last_crawl_ts(server_node: str) -> int | None:
             (server_node,),
         ).fetchone()
         return row[0] if row and row[0] is not None else None
+
+
+# --------------------------------------------------------------------------- #
+# scan_state (targeted Plex scan tracking)
+# --------------------------------------------------------------------------- #
+def replace_scan_state(server_node: str, media_type: str, folders: dict[str, str]) -> None:
+    """Reconcile scan_state for one (node, media_type) to `folders` = {scan_path: status}.
+
+    Upserts each folder's status; deletes rows whose scan_path is no longer present.
+    Preserves requested_at across reconciles (so a re-run does not reset the cooldown);
+    stamps scanned_at when a row's status becomes 'scanned'."""
+    with _conn() as c:
+        existing = {
+            r["scan_path"]: r
+            for r in c.execute(
+                "SELECT scan_path, status, requested_at, scanned_at FROM scan_state "
+                "WHERE server_node = ? AND media_type = ?",
+                (server_node, media_type),
+            ).fetchall()
+        }
+        keep = set(folders)
+        stale = [p for p in existing if p not in keep]
+        if stale:
+            c.executemany(
+                "DELETE FROM scan_state WHERE server_node=? AND media_type=? AND scan_path=?",
+                [(server_node, media_type, p) for p in stale],
+            )
+        now = int(time.time())
+        for path, status in folders.items():
+            prior = existing.get(path)
+            req_at = prior["requested_at"] if prior else None
+            scanned_at = prior["scanned_at"] if prior else None
+            if status == "scanned" and (prior is None or prior["status"] != "scanned"):
+                scanned_at = now
+            c.execute(
+                """
+                INSERT INTO scan_state (server_node, media_type, scan_path, status, requested_at, scanned_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(server_node, media_type, scan_path) DO UPDATE SET
+                    status=excluded.status,
+                    requested_at=excluded.requested_at,
+                    scanned_at=excluded.scanned_at
+                """,
+                (server_node, media_type, path, status, req_at, scanned_at),
+            )
+
+
+def get_pending_scans() -> list[sqlite3.Row]:
+    """Folders awaiting a scan, oldest-request-first (never-requested first)."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT server_node, media_type, scan_path, status, requested_at, scanned_at "
+            "FROM scan_state WHERE status = 'pending' "
+            "ORDER BY COALESCE(requested_at, 0) ASC, scan_path ASC"
+        ).fetchall()
+
+
+def mark_scan_requested(server_node: str, media_type: str, scan_path: str, ts: int) -> None:
+    """Mark a scan folder as 'requested', stamping the request timestamp."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE scan_state SET status='requested', requested_at=? "
+            "WHERE server_node=? AND media_type=? AND scan_path=?",
+            (ts, server_node, media_type, scan_path),
+        )
+
+
+def mark_scan_done(server_node: str, media_type: str, scan_path: str, ts: int) -> None:
+    """Mark a scan folder as 'scanned', stamping the completion timestamp."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE scan_state SET status='scanned', scanned_at=? "
+            "WHERE server_node=? AND media_type=? AND scan_path=?",
+            (ts, server_node, media_type, scan_path),
+        )
+
+
+def mark_scan_pending(server_node: str, media_type: str, scan_path: str) -> None:
+    """Revert a scan folder to 'pending' (e.g. after a scan timed out without a
+    confirmed completion). Keeps requested_at intact so the cooldown still throttles
+    re-requests; the next reconcile re-checks it against Plex and self-heals: if the
+    folder is actually present it flips to 'scanned', otherwise it stays 'pending'."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE scan_state SET status='pending' WHERE server_node=? AND media_type=? AND scan_path=?",
+            (server_node, media_type, scan_path),
+        )
+
+
+def count_scan_state() -> dict[str, int]:
+    """Count scan_state rows by status across all (node, media_type) pairs."""
+    with _conn() as c:
+        return {
+            r["status"]: r["n"]
+            for r in c.execute("SELECT status, COUNT(*) AS n FROM scan_state GROUP BY status").fetchall()
+        }

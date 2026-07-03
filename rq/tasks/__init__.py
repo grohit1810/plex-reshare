@@ -9,6 +9,7 @@ from .plex_reshare import (
     reconcile_lazy_deletes,
     startup,
 )
+from .plex_scan import plex_scan_worker, reconcile_scan_state
 
 __all__ = [
     "startup",
@@ -20,4 +21,6 @@ __all__ = [
     "get_show_leaves",
     "rebuild_redis_from_db",
     "reconcile_lazy_deletes",
+    "reconcile_scan_state",
+    "plex_scan_worker",
 ]

@@ -417,6 +417,7 @@ def crawl_movie_library(plex_server: dict = None, library: dict = None) -> None:
     logger.info(
         "movies " + kv(node=node, kept=len(seen), deleted=len(stale), secs=round(time.monotonic() - started, 1))
     )
+    rq_queue.enqueue("tasks.reconcile_scan_state", job_id="reconcile_scan_state", retry=rq_retries)
 
 
 def crawl_show_library(plex_server: dict = None, library: dict = None) -> None:
@@ -490,6 +491,7 @@ def crawl_show_library(plex_server: dict = None, library: dict = None) -> None:
             secs=round(time.monotonic() - started, 1),
         )
     )
+    rq_queue.enqueue("tasks.reconcile_scan_state", job_id="reconcile_scan_state", retry=rq_retries)
 
 
 def get_show_leaves(
@@ -693,6 +695,9 @@ def startup() -> None:
     db.init_db()
     # start the lazy-delete reconciler loop (drains pr:lazydelete -> sqlite cleanup)
     rq_queue.enqueue("tasks.reconcile_lazy_deletes", job_id="reconcile_lazy_deletes", retry=rq_retries)
+    # targeted-scan: reconcile scan_state on boot, which itself starts the scan-worker
+    # loop when PLEX_SCAN_ENABLED. No-op (returns immediately) when the feature is off.
+    rq_queue.enqueue("tasks.reconcile_scan_state", job_id="reconcile_scan_state", retry=rq_retries)
 
     if db.has_any_media():
         rebuild_redis_from_db()
