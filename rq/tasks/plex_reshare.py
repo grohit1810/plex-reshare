@@ -55,6 +55,11 @@ REFRESH_HOURS_MAX = config("REFRESH_HOURS_MAX", cast=int, default=12)
 FULL_CRAWL_DAYS_MIN = config("FULL_CRAWL_DAYS_MIN", cast=int, default=6)
 FULL_CRAWL_DAYS_MAX = config("FULL_CRAWL_DAYS_MAX", cast=int, default=9)
 
+# How long the per-node "crawl in progress" marker lives. Must comfortably exceed a
+# from-scratch crawl (which is minutes) so re-fired get_plex_servers calls skip a live
+# crawl; it only matters as a fallback if a crawl dies without clearing the marker.
+CRAWL_LOCK_TTL = config("CRAWL_LOCK_TTL", cast=int, default=3600)
+
 # Optionally split a large TV library into fixed-size batchNN/ folders in the listing
 # so no single shows/<guid>/ folder holds hundreds of shows. <= 0 disables batching
 # (flat shows/<guid>/<show>/...). The per-show batch assignment is PERSISTED and
@@ -321,6 +326,19 @@ def get_plex_servers() -> None:
         else:
             logger.info("due " + kv(node=node, reason="never_crawled"))
 
+        # In-progress guard (atomic): a crawl only stamps last_crawl when it COMPLETES,
+        # so while one runs (especially the slow from-scratch crawl) last_crawl is still
+        # stale/NULL. get_plex_servers is re-enqueued on EVERY http request (middleware)
+        # and by each web worker's startup, so without a guard those re-fires each pass
+        # the gate and launch ANOTHER full crawl -> many overlapping crawls hammering the
+        # friend (observed ~2.6x the expected request count). SET NX is atomic, so only
+        # the first caller acquires the marker and enqueues; the rest skip. The marker is
+        # NOT explicitly cleared -- its TTL (CRAWL_LOCK_TTL, ~1h) always expires long
+        # before the next 5-12h refresh is due, and letting it lapse also self-heals a
+        # crawl that died without finishing.
+        if not r.set(f"pr:crawling:{node}", now, nx=True, ex=CRAWL_LOCK_TTL):
+            logger.info("skip " + kv(node=node, reason="crawl_in_progress"))
+            continue
         rq_queue.enqueue("tasks.get_plex_libraries", retry=rq_retries, kwargs={"plex_server": plex_server})
 
 
